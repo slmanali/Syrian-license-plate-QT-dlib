@@ -43,8 +43,6 @@
 
 #include <capturethread.h>
 #include <QFormLayout>
-#include <capturethread1.h>
-#include <capturethread2.h>
 #include <QtSql>
 #include "form.h"
 #include "ip_camera.h"
@@ -151,7 +149,6 @@ public:
     bool video_proc1;
     bool video_proc2;
     Form *new_plate;
-    IP_Camera* ipp;
     string plate_region;
     string plate_digits;
     QSqlDatabase m_db;
@@ -274,13 +271,14 @@ private:
     Ui::MainWindow *ui;
     cv::Mat matOriginal;
     QImage qimgOriginal;
-    CaptureThread* cpThread;
-    CaptureThread1* cpThread1;
-    CaptureThread2* cpThread2;
+    void stopCapture(CaptureThread *&capture);
+    CaptureThread* cpThread = nullptr;
+    CaptureThread* cpThread1 = nullptr;
+    CaptureThread* cpThread2 = nullptr;
     QSerialPort* ser;
     QTimer* nam_tmr;
     QTimer* ser_tmr;
-    QTimer* int_tmr;
+    QTimer* int_tmr = nullptr;
     bool obstacle;
     bool prev_obstacle;
     int num_obs;

@@ -137,27 +137,31 @@ MainWindow::~MainWindow()
     if(!tmp.empty())
         tmp.release();
 
-    if(ip)
-        cpThread->release_ip();
-
-    if(ip1)
-        cpThread1->release_ip();
-
-    if(ip2)
-        cpThread2->release_ip();
-
-    if (video_proc)
-        cpThread->stop=true;
-    if (video_proc1)
-        cpThread1->stop=true;
-    if (video_proc2)
-        cpThread2->stop=true;
+    for (CaptureThread *capture : {cpThread, cpThread1, cpThread2}) {
+        if (capture)
+            capture->requestStop();
+    }
+    stopCapture(cpThread);
+    stopCapture(cpThread1);
+    stopCapture(cpThread2);
 
     m_db.close();
 
     if(!m_db.isOpen())
         qDebug( "Closed!" );
     delete ui;
+}
+//***************************************
+void MainWindow::stopCapture(CaptureThread *&capture)
+{
+    if (!capture)
+        return;
+    CaptureThread *previous = capture;
+    capture = nullptr;
+    QObject::disconnect(previous, nullptr, this, nullptr);
+    previous->requestStop();
+    previous->wait();
+    delete previous;
 }
 //***************************************
 cv::Rect MainWindow::dlib_rect_detectionToOpenCV(dlib::rect_detection r)
@@ -984,6 +988,9 @@ std::vector<cv::Mat> MainWindow::image_recognize(cv::Mat tmpp)
 //***************************************
 void MainWindow::image_recognize_v1(cv::Mat _src)
 {
+    if (!cpThread || sender() != cpThread || !video_proc || cpThread->isPaused())
+        return;
+
     freq = cv::getTickFrequency();
     CvSize ss;
     if(plate_Ent)
@@ -1240,7 +1247,7 @@ void MainWindow::image_recognize_v1(cv::Mat _src)
                     s_qry.exec();
                     if(s_qry.next())
                     {
-                        cpThread->tmrTimer->stop();
+                        cpThread->setPaused(true);
                         QMessageBox::warning(this,tr("تحذير"),tr("كشف سيارة مسروقة"),
                                                       QMessageBox::Ok);
                     }
@@ -1319,6 +1326,8 @@ void MainWindow::image_recognize_v1(cv::Mat _src)
 //***************************************
 void MainWindow::on_open_v1_clicked()
 {
+    if (cpThread)
+        return;
     fileName.clear();
     fileName = QFileDialog::getOpenFileName(this,
          tr("Open Video"),"D:\\Company_work\\Cars",tr("Images (*.avi *.mp4)"));
@@ -1332,7 +1341,7 @@ void MainWindow::on_open_v1_clicked()
         if (!videoSortDetecotDemo->InitTracker(cv::Mat()))
             return;
         ui->listWidget_v1->clear();
-        cpThread = new CaptureThread(fileName_string);
+        cpThread = new CaptureThread(fileName_string, this);
         video_proc=true;
         ui->open_v1->setEnabled(false);
         ui->open_ip_camera1->setEnabled(false);
@@ -1365,250 +1374,232 @@ void MainWindow::on_open_v1_clicked()
 //***************************************
 void MainWindow::on_stop_v1_clicked()
 {
-    if(!ip)
-    {
-        if(ui->checkBox_2->isChecked())
-            QObject::disconnect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show(cv::Mat)));
-        else
-            QObject::disconnect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v1(cv::Mat)));
-    }
-    else
-    {
-        cpThread->release_ip();
-        if(ui->checkBox_2->isChecked())
-            QObject::disconnect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show(cv::Mat)));
-        else
-            QObject::disconnect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v1(cv::Mat)));
-    }
+    stopCapture(cpThread);
     video_proc=false;
     ip=false;
-    cpThread->tmrTimer->stop();
-    cpThread->stop=true;
     fileName.clear();
     ui->label_v1->clear();
     ui->listWidget_v1->clear();
     ui->stop_v1->setEnabled(false);
     ui->pause_v1->setEnabled(false);
     ui->open_v1->setEnabled(true);
-    ui->open_ip_camera1->setEnabled(true);    
+    ui->open_ip_camera1->setEnabled(true);
+    if (int_tmr) {
+        int_tmr->stop();
+        delete int_tmr;
+        int_tmr = nullptr;
+    }
+    if (record) {
+        video_rec->release();
+        record = false;
+    }
+    ui->record_camera_1->setEnabled(false);
     ui->time_interval_check->setEnabled(true);
-    if(ui->time_interval_check->isChecked())
+    if (ui->time_interval_check->isChecked())
         ui->interval_time_combo->setEnabled(true);
     l_cit=0;
-    return;
 }
 //***************************************
 void MainWindow::fini()
 {
+    if (!cpThread || sender() != cpThread)
+        return;
+    const QString error = cpThread->errorString();
+    stopCapture(cpThread);
+    video_proc=false;
+    ip=false;
     fileName.clear();
-    QMessageBox::StandardButton reply;
-
-    reply = QMessageBox::information(this, "تحذير", "انتهاء الفيديو",
-                                  QMessageBox::Ok);
-    if(ip)
-       cpThread->release_ip();
-
-    if(ui->checkBox_2->isChecked())
-        QObject::disconnect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show(cv::Mat)));
-    else
-        QObject::disconnect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v1(cv::Mat)));
-    cpThread->tmrTimer->stop();
-    cpThread->stop=true;
-    cpThread->tmrTimer->stop();
-    cpThread->stop=true;
     ui->open_v1->setEnabled(true);
     ui->stop_v1->setEnabled(false);
     ui->pause_v1->setEnabled(false);
     ui->open_ip_camera1->setEnabled(true);
     ui->label_v1->clear();
-    ip=false;
+    if (int_tmr) {
+        int_tmr->stop();
+        delete int_tmr;
+        int_tmr = nullptr;
+    }
+    if (record) {
+        video_rec->release();
+        record = false;
+    }
+    ui->record_camera_1->setEnabled(false);
+    ui->time_interval_check->setEnabled(true);
+    if (ui->time_interval_check->isChecked())
+        ui->interval_time_combo->setEnabled(true);
     l_cit=0;
-    ui->record_camera_1->setEnabled(true);
-    return;
+    if (error.isEmpty())
+        QMessageBox::information(this, tr("تحذير"), tr("انتهاء الفيديو"), QMessageBox::Ok);
+    else
+        QMessageBox::warning(this, tr("Capture error"), error, QMessageBox::Ok);
 }
 //***************************************
 void MainWindow::fini1()
 {
+    if (!cpThread1 || sender() != cpThread1)
+        return;
+    const QString error = cpThread1->errorString();
+    stopCapture(cpThread1);
+    video_proc1=false;
+    ip1=false;
     fileName.clear();
-    QMessageBox::StandardButton reply;
-
-    reply = QMessageBox::information(this, "تحذير", "انتهاء الفيديو",
-                                  QMessageBox::Ok);
-    if(ip1)
-        cpThread1->release_ip();
-
-    if(ui->checkBox_3->isChecked())
-        QObject::disconnect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show1(cv::Mat)));
-    else
-        QObject::disconnect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v2(cv::Mat)));
-    cpThread1->tmrTimer->stop();
-    cpThread1->stop=true;
     ui->open_v2->setEnabled(true);
     ui->stop_v2->setEnabled(false);
     ui->pause_v2->setEnabled(false);
     ui->open_ip_camera2->setEnabled(true);
     ui->label_v2->clear();
-    ip1=false;
+    ui->record_camera_2->setEnabled(false);
     l_cit1=0;
-    ui->record_camera_2->setEnabled(true);
-    return;
+    if (error.isEmpty())
+        QMessageBox::information(this, tr("تحذير"), tr("انتهاء الفيديو"), QMessageBox::Ok);
+    else
+        QMessageBox::warning(this, tr("Capture error"), error, QMessageBox::Ok);
 }
 //***************************************
 void MainWindow::fini2()
 {
+    if (!cpThread2 || sender() != cpThread2)
+        return;
+    const QString error = cpThread2->errorString();
+    stopCapture(cpThread2);
+    video_proc2=false;
+    ip2=false;
     fileName.clear();
-    QMessageBox::StandardButton reply;
-
-    reply = QMessageBox::information(this, "تحذير", "انتهاء الفيديو",
-                                  QMessageBox::Ok);
-    if(ip2)
-     cpThread2->release_ip();
-
-    if(ui->checkBox_5->isChecked())
-        QObject::disconnect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show2(cv::Mat)));
-    else
-        QObject::disconnect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v3(cv::Mat)));
-    cpThread2->tmrTimer->stop();
-    cpThread2->stop=true;
     ui->open_v3->setEnabled(true);
     ui->stop_v3->setEnabled(false);
     ui->pause_v3->setEnabled(false);
     ui->open_ip_camera3->setEnabled(true);
     ui->label_v3->clear();
-    ip2=false;
-
+    ui->record_camera_3->setEnabled(false);
     l_cit2=0;
-    ui->record_camera_3->setEnabled(true);
-    return;
+    if (error.isEmpty())
+        QMessageBox::information(this, tr("تحذير"), tr("انتهاء الفيديو"), QMessageBox::Ok);
+    else
+        QMessageBox::warning(this, tr("Capture error"), error, QMessageBox::Ok);
 }
 //***************************************
 void MainWindow::on_pause_v1_clicked()
 {
-    if(!ip)
-    {
-        if(cpThread->tmrTimer->isActive())
-            cpThread->tmrTimer->stop();
-        else
-            cpThread->tmrTimer->start(40);
-    }
-    else
-        cpThread->pause_ip();
+    if (cpThread)
+        cpThread->togglePause();
 }
 //***************************************
 void MainWindow::on_open_ip_camera1_clicked()
 {
-    ipp=new IP_Camera();
-    ipp->setAttribute( Qt::WA_DeleteOnClose );
-    ipp->showNormal();
-    QObject::connect(ipp, SIGNAL(destroyed(QObject*)),this, SLOT(done()));
+    IP_Camera *camera = new IP_Camera(this);
+    camera->setAttribute(Qt::WA_DeleteOnClose);
+    QObject::connect(camera, &IP_Camera::cameraAccepted, this, &MainWindow::done);
+    camera->showNormal();
 }
 //***************************************
 void MainWindow::done()
 {
-    if(ipp->my_closs)
+    IP_Camera *camera = qobject_cast<IP_Camera *>(sender());
+    if (!camera || !camera->my_closs || cpThread)
+        return;
+    const std::string videoStreamAddress = "rtsp://"+camera->user.toStdString()+":"
+            +camera->pass.toStdString()+"@"+camera->Ip.toStdString()+":554";///MediaInput/h264";
+    cv::Size rtspRess(camera->width, camera->height);
+    cpThread = new CaptureThread(QString::fromStdString(videoStreamAddress), rtspRess, this);
+    video_proc=true;
+    ui->open_v1->setEnabled(false);
+    ui->open_ip_camera1->setEnabled(false);
+
+    if(ui->checkBox_2->isChecked())
+        QObject::connect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show(cv::Mat)));
+    else
     {
-        const std::string videoStreamAddress = "rtsp://"+ipp->user.toStdString()+":"
-                +ipp->pass.toStdString()+"@"+ipp->Ip.toStdString()+":554";///MediaInput/h264";
-        qDebug() << QString::fromStdString(videoStreamAddress);
-        cv::Size rtspRess(ipp->width, ipp->height);
-        cpThread = new CaptureThread(QString::fromStdString(videoStreamAddress),rtspRess);
-        video_proc=true;
-        ui->open_v1->setEnabled(false);
-        ui->open_ip_camera1->setEnabled(false);
-
-        if(ui->checkBox_2->isChecked())
-            QObject::connect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show(cv::Mat)));
-        else
-        {
-            videoSortDetecotDemo = new VideoSortDetector();
-            videoSortDetecotDemo->setMinTraceSize(8);
-            videoSortDetecotDemo->setDetectorParam("net/yolo-voc.cfg", "net/yolo-voc.weights", "net/voc.names", "car");
-            if (!videoSortDetecotDemo->InitTracker(cv::Mat()))
-                return;
-            if(ui->time_interval_check->isChecked())
-            {
-                int_tmr=new QTimer(this);
-                QObject::connect(int_tmr,SIGNAL(timeout()),this,SLOT(int_finish()));
-                std::string::size_type sz;   // alias of size_t
-                int i_dec = std::stoi (((ui->interval_time_combo->currentText()).toStdString()),&sz);
-                int_tmr->start(i_dec*1000);
-                interval_proc=false;
-
-            }
-            QObject::connect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v1(cv::Mat)));
+        videoSortDetecotDemo = new VideoSortDetector();
+        videoSortDetecotDemo->setMinTraceSize(8);
+        videoSortDetecotDemo->setDetectorParam("net/yolo-voc.cfg", "net/yolo-voc.weights", "net/voc.names", "car");
+        if (!videoSortDetecotDemo->InitTracker(cv::Mat())) {
+            on_stop_v1_clicked();
+            return;
         }
+        if(ui->time_interval_check->isChecked())
+        {
+            int_tmr=new QTimer(this);
+            QObject::connect(int_tmr,SIGNAL(timeout()),this,SLOT(int_finish()));
+            std::string::size_type sz;   // alias of size_t
+            int i_dec = std::stoi (((ui->interval_time_combo->currentText()).toStdString()),&sz);
+            int_tmr->start(i_dec*1000);
+            interval_proc=false;
 
-        cpThread->start();
-        frame_count=0;
-        frame_proc=0;
-        ui->stop_v1->setEnabled(true);
-        ui->pause_v1->setEnabled(true);
-        ip=true;
-        ui->time_interval_check->setEnabled(false);
-        ui->interval_time_combo->setEnabled(false);
+        }
+        QObject::connect(cpThread, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v1(cv::Mat)));
     }
-    return;
+
+    QObject::connect(cpThread, SIGNAL(finished()), this, SLOT(fini()));
+    cpThread->start();
+    frame_count=0;
+    frame_proc=0;
+    ui->stop_v1->setEnabled(true);
+    ui->pause_v1->setEnabled(true);
+    ip=true;
+    ui->time_interval_check->setEnabled(false);
+    ui->interval_time_combo->setEnabled(false);
 }
 //***************************************
 void MainWindow::done1()
 {
-    if(ipp->my_closs)
-    {
-        const std::string videoStreamAddress = "rtsp://"+ipp->user.toStdString()+":"+ipp->pass.toStdString()
-                +"@"+ipp->Ip.toStdString()+"/MediaInput/h264";
-        qDebug() << QString::fromStdString(videoStreamAddress);
-        cv::Size rtspRess(ipp->width, ipp->height);
+    IP_Camera *camera = qobject_cast<IP_Camera *>(sender());
+    if (!camera || !camera->my_closs || cpThread1)
+        return;
+    const std::string videoStreamAddress = "rtsp://"+camera->user.toStdString()+":"+camera->pass.toStdString()
+        +"@"+camera->Ip.toStdString()+"/MediaInput/h264";
+    cv::Size rtspRess(camera->width, camera->height);
 
-        cpThread1 = new CaptureThread1(QString::fromStdString(videoStreamAddress),rtspRess);
-            video_proc1=true;
-            ui->open_v2->setEnabled(false);
-            ui->open_ip_camera2->setEnabled(false);
-            if(ui->checkBox_3->isChecked())
-                QObject::connect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show1(cv::Mat)));
-            else
-                QObject::connect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v2(cv::Mat)));
+    cpThread1 = new CaptureThread(QString::fromStdString(videoStreamAddress), rtspRess, this);
+    video_proc1=true;
+    ui->open_v2->setEnabled(false);
+    ui->open_ip_camera2->setEnabled(false);
+    if(ui->checkBox_3->isChecked())
+        QObject::connect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show1(cv::Mat)));
+    else
+        QObject::connect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v2(cv::Mat)));
 
-            cpThread1->start();
-            frame_count1=0;
-            frame_proc=0;
-            ui->stop_v2->setEnabled(true);
-            ui->pause_v2->setEnabled(true);
-            ip1=true;
-            img_num=ui->Pic_Num->text().toInt();
-    }
-    return;
+    QObject::connect(cpThread1, SIGNAL(finished()), this, SLOT(fini1()));
+    cpThread1->start();
+    frame_count1=0;
+    frame_proc=0;
+    ui->stop_v2->setEnabled(true);
+    ui->pause_v2->setEnabled(true);
+    ip1=true;
+    img_num=ui->Pic_Num->text().toInt();
 }
 //***************************************
 void MainWindow::done2()
 {
-    if(ipp->my_closs)
-    {
-        const std::string videoStreamAddress = "rtsp://"+ipp->user.toStdString()+":"+ipp->pass.toStdString()
-                +"@"+ipp->Ip.toStdString()+"/MediaInput/h264";
-        qDebug() << QString::fromStdString(videoStreamAddress);
-        cv::Size rtspRess(ipp->width, ipp->height);
+    IP_Camera *camera = qobject_cast<IP_Camera *>(sender());
+    if (!camera || !camera->my_closs || cpThread2)
+        return;
+    const std::string videoStreamAddress = "rtsp://"+camera->user.toStdString()+":"+camera->pass.toStdString()
+        +"@"+camera->Ip.toStdString()+"/MediaInput/h264";
+    cv::Size rtspRess(camera->width, camera->height);
 
-        cpThread2 = new CaptureThread2(QString::fromStdString(videoStreamAddress),rtspRess);
-            video_proc2=true;
-            ui->open_v3->setEnabled(false);
-            ui->open_ip_camera3->setEnabled(false);
-            if(ui->checkBox_5->isChecked())
-                QObject::connect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show2(cv::Mat)));
-            else
-                QObject::connect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v3(cv::Mat)));
+    cpThread2 = new CaptureThread(QString::fromStdString(videoStreamAddress), rtspRess, this);
+    video_proc2=true;
+    ui->open_v3->setEnabled(false);
+    ui->open_ip_camera3->setEnabled(false);
+    if(ui->checkBox_5->isChecked())
+        QObject::connect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show2(cv::Mat)));
+    else
+        QObject::connect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v3(cv::Mat)));
 
-            cpThread2->start();
-            frame_count2=0;
-            frame_proc=0;
-            ui->stop_v3->setEnabled(true);
-            ui->pause_v3->setEnabled(true);
-            ip2=true;
-    }
-    return;
+    QObject::connect(cpThread2, SIGNAL(finished()), this, SLOT(fini2()));
+    cpThread2->start();
+    frame_count2=0;
+    frame_proc=0;
+    ui->stop_v3->setEnabled(true);
+    ui->pause_v3->setEnabled(true);
+    ip2=true;
 }
 //***************************************
 void MainWindow::camera_show(cv::Mat src1)
 {
+    if (!cpThread || sender() != cpThread || !video_proc || cpThread->isPaused())
+        return;
+
     frame_count++;
     if(record)
     {
@@ -1641,14 +1632,14 @@ void MainWindow::camera_show(cv::Mat src1)
 void MainWindow::on_record_camera_1_clicked()
 {
 
+    if (!cpThread)
+        return;
+    const cv::Size ss = cpThread->frameSize();
+    if (ss.width <= 0 || ss.height <= 0)
+        return;
     QString current_t = QTime::currentTime().toString("h_m");
     record=true;
     string gg=home_folder.toStdString()+"\\"+current_t.toStdString()+".avi";
-    cv::Size ss;
-    if(ip)
-        ss=cv::Size (ipp->width,ipp->height);
-    else
-        ss=cv::Size(cpThread->capWebam.get(CV_CAP_PROP_FRAME_WIDTH),cpThread->capWebam.get(CV_CAP_PROP_FRAME_WIDTH));
     video_rec = new cv::VideoWriter( gg.c_str(), CV_FOURCC('m','p', '4', 'v'), 15, ss );
     ui->record_camera_1->setEnabled(false);
     frame_rec=0;
@@ -1657,6 +1648,8 @@ void MainWindow::on_record_camera_1_clicked()
 //***************************************
 void MainWindow::on_open_v2_clicked()
 {
+    if (cpThread1)
+        return;
     fileName.clear();
     fileName = QFileDialog::getOpenFileName(this,
          tr("Open Video"),"D:\\Company_work\\Cars",tr("Images (*.avi *.mp4)"));
@@ -1666,7 +1659,7 @@ void MainWindow::on_open_v2_clicked()
         std::string fileName_string = fileName.toStdString();
 
         ui->listWidget_v2->clear();
-        cpThread1 = new CaptureThread1(fileName_string);
+        cpThread1 = new CaptureThread(fileName_string, this);
         video_proc1=true;
         ui->open_v2->setEnabled(false);
         ui->open_ip_camera2->setEnabled(false);
@@ -1688,6 +1681,9 @@ void MainWindow::on_open_v2_clicked()
 //***************************************
 void MainWindow::camera_show1(cv::Mat src1)
 {
+    if (!cpThread1 || sender() != cpThread1 || !video_proc1 || cpThread1->isPaused())
+        return;
+
     frame_count1++;
     CvSize ss;
     cv::Mat src;
@@ -1704,6 +1700,9 @@ void MainWindow::camera_show1(cv::Mat src1)
 //***************************************
 void MainWindow::image_recognize_v2(cv::Mat src)
 {
+    if (!cpThread1 || sender() != cpThread1 || !video_proc1 || cpThread1->isPaused())
+        return;
+
     cv::Mat tmpp1;
     CvSize ss;
  /*   if(record)
@@ -1861,7 +1860,7 @@ void MainWindow::image_recognize_v2(cv::Mat src)
                     s_qry.exec();
                     if(s_qry.next())
                     {
-                        cpThread->tmrTimer->stop();
+                        cpThread1->setPaused(true);
                         QMessageBox::warning(this,tr("تحذير"),tr("كشف سيارة مسروقة"),
                                                       QMessageBox::Ok);
                     }
@@ -1923,38 +1922,15 @@ void MainWindow::image_recognize_v2(cv::Mat src)
 //***************************************
 void MainWindow::on_pause_v2_clicked()
 {
-    if(!ip1)
-    {
-        if(cpThread1->tmrTimer->isActive())
-            cpThread1->tmrTimer->stop();
-        else
-            cpThread1->tmrTimer->start(40);
-    }
-    else
-        cpThread1->pause_ip();
+    if (cpThread1)
+        cpThread1->togglePause();
 }
 //***************************************
 void MainWindow::on_stop_v2_clicked()
 {
-    if(!ip1)
-    {
-        if(ui->checkBox_3->isChecked())
-            QObject::disconnect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show1(cv::Mat)));
-        else
-            QObject::disconnect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v2(cv::Mat)));
-    }
-    else
-    {
-        cpThread1->release_ip();
-        if(ui->checkBox_3->isChecked())
-            QObject::disconnect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show1(cv::Mat)));
-        else
-            QObject::disconnect(cpThread1, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v2(cv::Mat)));
-    }
+    stopCapture(cpThread1);
     video_proc1=false;
     ip1=false;
-    cpThread1->tmrTimer->stop();
-    cpThread1->stop=true;
     fileName.clear();
     ui->label_v2->clear();
     ui->listWidget_v2->clear();
@@ -1963,19 +1939,20 @@ void MainWindow::on_stop_v2_clicked()
     ui->open_v2->setEnabled(true);
     ui->open_ip_camera2->setEnabled(true);
     l_cit1=0;
-    return;
 }
 //***************************************
 void MainWindow::on_open_ip_camera2_clicked()
 {
-    ipp=new IP_Camera();
-    ipp->setAttribute( Qt::WA_DeleteOnClose );
-    ipp->showNormal();
-    QObject::connect(ipp, SIGNAL(destroyed(QObject*)),this, SLOT(done1()));
+    IP_Camera *camera = new IP_Camera(this);
+    camera->setAttribute(Qt::WA_DeleteOnClose);
+    QObject::connect(camera, &IP_Camera::cameraAccepted, this, &MainWindow::done1);
+    camera->showNormal();
 }
 //***************************************
 void MainWindow::on_open_v3_clicked()
 {
+    if (cpThread2)
+        return;
     fileName.clear();
     fileName = QFileDialog::getOpenFileName(this,
          tr("Open Video"),"D:\\Company_work\\Cars",tr("Images (*.avi *.mp4)"));
@@ -1985,7 +1962,7 @@ void MainWindow::on_open_v3_clicked()
         std::string fileName_string = fileName.toStdString();
 
         ui->listWidget_v3->clear();
-        cpThread2 = new CaptureThread2(fileName_string);
+        cpThread2 = new CaptureThread(fileName_string, this);
         video_proc2=true;
         ui->open_v3->setEnabled(false);
         ui->open_ip_camera3->setEnabled(false);
@@ -2007,6 +1984,9 @@ void MainWindow::on_open_v3_clicked()
 //***************************************
 void MainWindow::camera_show2(cv::Mat src1)
 {
+    if (!cpThread2 || sender() != cpThread2 || !video_proc2 || cpThread2->isPaused())
+        return;
+
     frame_count2++;
     CvSize ss;
     cv::Mat src;
@@ -2023,6 +2003,9 @@ void MainWindow::camera_show2(cv::Mat src1)
 //***************************************
 void MainWindow::image_recognize_v3(cv::Mat _src)
 {
+    if (!cpThread2 || sender() != cpThread2 || !video_proc2 || cpThread2->isPaused())
+        return;
+
     CvSize ss;
     cv::Mat tmpp2;
  /*   if(record)
@@ -2201,7 +2184,7 @@ void MainWindow::image_recognize_v3(cv::Mat _src)
                     s_qry.exec();
                     if(s_qry.next())
                     {
-                        cpThread->tmrTimer->stop();
+                        cpThread2->setPaused(true);
                         QMessageBox::warning(this,tr("تحذير"),tr("كشف سيارة مسروقة"),
                                                       QMessageBox::Ok);
                     }
@@ -2269,38 +2252,15 @@ void MainWindow::image_recognize_v3(cv::Mat _src)
 //***************************************
 void MainWindow::on_pause_v3_clicked()
 {
-    if(!ip2)
-    {
-        if(cpThread2->tmrTimer->isActive())
-            cpThread2->tmrTimer->stop();
-        else
-            cpThread2->tmrTimer->start(40);
-    }
-    else
-        cpThread2->pause_ip();
+    if (cpThread2)
+        cpThread2->togglePause();
 }
 //***************************************
 void MainWindow::on_stop_v3_clicked()
 {
-    if(!ip2)
-    {
-        if(ui->checkBox_5->isChecked())
-            QObject::disconnect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show2(cv::Mat)));
-        else
-            QObject::disconnect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v3(cv::Mat)));
-    }
-    else
-    {
-        cpThread2->release_ip();
-        if(ui->checkBox_5->isChecked())
-            QObject::disconnect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(camera_show2(cv::Mat)));
-        else
-            QObject::disconnect(cpThread2, SIGNAL(frameCaptured(cv::Mat)),this, SLOT(image_recognize_v3(cv::Mat)));
-    }
+    stopCapture(cpThread2);
     video_proc2=false;
     ip2=false;
-    cpThread2->tmrTimer->stop();
-    cpThread2->stop=true;
     fileName.clear();
     ui->label_v3->clear();
     ui->listWidget_v3->clear();
@@ -2313,11 +2273,10 @@ void MainWindow::on_stop_v3_clicked()
 //***************************************
 void MainWindow::on_open_ip_camera3_clicked()
 {
-    ipp=new IP_Camera();
-    ipp->setAttribute( Qt::WA_DeleteOnClose );
-    ipp->showNormal();
-    QObject::connect(ipp, SIGNAL(destroyed(QObject*)),this, SLOT(done2()));
-    ip_num=2;
+    IP_Camera *camera = new IP_Camera(this);
+    camera->setAttribute(Qt::WA_DeleteOnClose);
+    QObject::connect(camera, &IP_Camera::cameraAccepted, this, &MainWindow::done2);
+    camera->showNormal();
 }
 //***************************************
 void MainWindow::on_Trigger_bt_clicked()

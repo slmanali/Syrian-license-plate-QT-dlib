@@ -1,255 +1,304 @@
 #include "capturethread.h"
-#include <QDebug>
-bool pause=false;
-Q_DECLARE_METATYPE(cv::Mat)
-//***************************************
-#define RTSP
-#ifdef RTSP
+
+#include <QByteArray>
+#include <QMutexLocker>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/videoio.hpp>
 #include <vlc/vlc.h>
-libvlc_instance_t *inst;
-// RTSP address
-//char* rtspAddress = "rtsp://admin:12345@196.10.10.155:554";
-// Video resolution WxH
-//cv::Size rtspRes(528, 384);
+#include <atomic>
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <stdexcept>
+#include <vector>
 
-struct VideoDataStruct
+namespace {
+
+struct StreamFrames
 {
-    int param;
+    explicit StreamFrames(cv::Size size)
+    {
+        // LibVLC requires aligned planes. Pad rows and storage to 32 bytes too.
+        pitch = (static_cast<unsigned>(size.width) * 3u + 31u) & ~31u;
+        const std::size_t rows = (static_cast<std::size_t>(size.height) + 31u) & ~std::size_t(31u);
+        if (rows > (std::numeric_limits<std::size_t>::max() - 31u) / pitch)
+            throw std::length_error("Stream frame is too large");
+        storage.resize(static_cast<std::size_t>(pitch) * rows + 31u);
+        const std::uintptr_t aligned =
+                (reinterpret_cast<std::uintptr_t>(storage.data()) + 31u) & ~std::uintptr_t(31u);
+        pixels = reinterpret_cast<unsigned char *>(aligned);
+    }
+
+    QMutex mutex;
+    std::vector<unsigned char> storage;
+    unsigned char *pixels = nullptr;
+    unsigned pitch = 0;
+    bool ready = false;
+    std::atomic<bool> failed{false};
 };
-int done = 0;
-libvlc_media_player_t *mp;
-unsigned int videoBufferSize = 0;
-uint8_t *videoBuffer = 0;
-//***************************************
-void cbVideoPrerender(void *p_video_data, uint8_t **pp_pixel_buffer, int size)
+
+void *lockVideo(void *opaque, void **planes)
 {
-    if (size > videoBufferSize || !videoBuffer)
+    StreamFrames *frames = static_cast<StreamFrames *>(opaque);
+    frames->mutex.lock();
+    *planes = frames->pixels;
+    return nullptr;
+}
+
+void unlockVideo(void *opaque, void *, void *const *)
+{
+    StreamFrames *frames = static_cast<StreamFrames *>(opaque);
+    frames->ready = true;
+    frames->mutex.unlock();
+}
+
+void streamError(const libvlc_event_t *, void *opaque)
+{
+    static_cast<StreamFrames *>(opaque)->failed.store(true);
+}
+
+struct PlayerDeleter
+{
+    void operator()(libvlc_media_player_t *player) const
     {
-        printf("Reallocate raw video buffer %d bytes\n", size);
-        free(videoBuffer);
-        videoBuffer = (uint8_t *)malloc(size);
-        videoBufferSize = size;
+        // Stop decoding before the callback context and pixel storage go away.
+        libvlc_media_player_stop(player);
+        libvlc_media_player_release(player);
     }
+};
 
-    // videoBuffer = (uint8_t *)malloc(size);
-    *pp_pixel_buffer = videoBuffer;
-}
-//***************************************
-void cbVideoPostrender(void *p_video_data, uint8_t *p_pixel_buffer, int width, int height, int pixel_pitch, int size, int64_t pts)
+} // namespace
+
+CaptureThread::CaptureThread(QObject *parent)
+    : CaptureThread(0, parent)
 {
-    // Unlocking
-    //CloseHandle(hMutex);
-
 }
-//***************************************
-static void handleEvent(const libvlc_event_t* pEvt, void* pUserData)
+
+CaptureThread::CaptureThread(int cameraIndex, QObject *parent)
+    : QThread(parent), m_source(Source::Camera), m_cameraIndex(cameraIndex)
 {
-    libvlc_time_t time;
-    switch (pEvt->type)
-    {
-    case libvlc_MediaPlayerTimeChanged:
-        time = libvlc_media_player_get_time(mp);
-        printf("MediaPlayerTimeChanged %lld ms\n", (long long)time);
-        break;
-    case libvlc_MediaPlayerEndReached:
-        printf("MediaPlayerEndReached\n");
-        done = 1;
-        break;
-    default:
-        printf("%s\n", libvlc_event_type_name(pEvt->type));
-    }
+    qRegisterMetaType<cv::Mat>("cv::Mat");
 }
-#endif
-//***************************************
-CaptureThread::CaptureThread(QObject* parent):QThread(parent)
+
+CaptureThread::CaptureThread(const std::string &videoPath, QObject *parent)
+    : QThread(parent), m_source(Source::VideoFile), m_videoPath(videoPath)
 {
-    capWebam.open(0);
-    if(!capWebam.isOpened()) return;
-    QThread* t = new QThread();
-    moveToThread(t);
-    t->start();
-    tmrTimer = new QTimer;
-
-    QObject::connect(tmrTimer, SIGNAL(timeout()),this, SLOT(captureFrame()));
-    connect(this, SIGNAL(finished()), t, SLOT(quit()));
-    tmrTimer->start(40);
+    qRegisterMetaType<cv::Mat>("cv::Mat");
 }
-//***************************************
-CaptureThread::CaptureThread(std::string video_path)
+
+CaptureThread::CaptureThread(const QString &streamUrl, cv::Size resolution, QObject *parent)
+    : QThread(parent), m_source(Source::Stream), m_streamUrl(streamUrl), m_resolution(resolution)
 {
-    capWebam.open(video_path);
-    if(!capWebam.isOpened())
-    {
-        qDebug() << "can't open";
-        return;
-    }
-    QThread* t = new QThread();
-    moveToThread(t);
-    t->start();
-    tmrTimer = new QTimer;
-
-    qRegisterMetaType< cv::Mat >("cv::Mat");
-    QObject::connect(tmrTimer, SIGNAL(timeout()),this, SLOT(captureFrame()));
-//    connect(this, SIGNAL(finished()), t, SLOT(quit()));
-    tmrTimer->start(40);
+    qRegisterMetaType<cv::Mat>("cv::Mat");
 }
-//***************************************
-CaptureThread::CaptureThread(QString video_path,cv::Size  rtspRes)
+
+CaptureThread::~CaptureThread()
 {
-#ifdef RTSP
-    // VLC pointers
-    libvlc_media_t *m;
-    void *pUserData = 0;
-
-    VideoDataStruct dataStruct;
-
-    // VLC options
-    char smem_options[1000];
-
-    // RV24
-    sprintf_s(smem_options
-        , "#transcode{vcodec=RV24}:smem{"
-        "video-prerender-callback=%lld,"
-        "video-postrender-callback=%lld,"
-        "video-data=%lld,"
-        "no-time-sync},"
-        , (long long int)(intptr_t)(void*)&cbVideoPrerender
-        , (long long int)(intptr_t)(void*)&cbVideoPostrender
-        , (long long int)(intptr_t)(void*)&dataStruct
-        );
-
-    const char * const vlc_args[] = {
-        "-I", "dummy",            // Don't use any interface
-        "--ignore-config",        // Don't use VLC's config
-//        "--extraintf=logger",     // Log anything
-        "--verbose=1",            // Be verbose
-        "--sout", smem_options    // Stream to memory
-    };
-
-    // Launch VLC
-    inst = libvlc_new(sizeof(vlc_args) / sizeof(vlc_args[0]), vlc_args);
-    rtspReso= rtspRes;
-    // Create a new item
-    m = libvlc_media_new_location(inst, video_path.toStdString().c_str());
-
-    // Create a media player playing environement
-    mp = libvlc_media_player_new_from_media(m);
-
-    libvlc_event_manager_t* eventManager = libvlc_media_player_event_manager(mp);
-    libvlc_event_attach(eventManager, libvlc_MediaPlayerTimeChanged, handleEvent, pUserData);
-    libvlc_event_attach(eventManager, libvlc_MediaPlayerEndReached, handleEvent, pUserData);
-    libvlc_event_attach(eventManager, libvlc_MediaPlayerPositionChanged, handleEvent, pUserData);
-
-    //libvlc_video_set_format(mp, "RV24", 240, 320, 240 * 3 );
-
-    // play the media_player
-    libvlc_media_player_play(mp);
-    #endif
-    QThread* t = new QThread();
-    moveToThread(t);
-    t->start();
-    tmrTimer = new QTimer;
-
-    qRegisterMetaType< cv::Mat >("cv::Mat");
-    QObject::connect(tmrTimer, SIGNAL(timeout()),this, SLOT(captureFrame1()));
-    tmrTimer->start(20);
+    requestStop();
+    wait();
 }
-//***************************************
-CaptureThread::CaptureThread(cv::Mat ttmp)
+
+void CaptureThread::requestStop()
 {
-    src=ttmp;
-    QThread* t = new QThread();
-    moveToThread(t);
-    t->start();
-    tmrTimer = new QTimer;
-
-    qRegisterMetaType< cv::Mat >("cv::Mat");
-    QObject::connect(tmrTimer, SIGNAL(timeout()),this, SLOT(Frame_detect()));
-    connect(this, SIGNAL(finished()), t, SLOT(quit()));
-//    QObject::connect(this, SIGNAL(finished()), this, SLOT(terminate()));
-//    QObject::connect(this, SIGNAL(finished()), this, SLOT(deleteLater()));
-    tmrTimer->start(40);
+    QMutexLocker locker(&m_mutex);
+    requestInterruption();
+    m_stateChanged.wakeAll();
 }
-//***************************************
+
+void CaptureThread::setPaused(bool paused)
+{
+    QMutexLocker locker(&m_mutex);
+    m_paused = paused;
+    m_stateChanged.wakeAll();
+}
+
+void CaptureThread::togglePause()
+{
+    QMutexLocker locker(&m_mutex);
+    m_paused = !m_paused;
+    m_stateChanged.wakeAll();
+}
+
+bool CaptureThread::isPaused() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_paused;
+}
+
+cv::Size CaptureThread::frameSize() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_frameSize;
+}
+
+QString CaptureThread::errorString() const
+{
+    QMutexLocker locker(&m_mutex);
+    return m_error;
+}
+
 void CaptureThread::run()
 {
-//    QObject::connect(tmrTimer, SIGNAL(timeout()), this, SLOT(captureFrame()));
-
-    exec();
-}
-//***************************************
-int mmm=10;
-int sss=0;
-//***************************************
-void CaptureThread::captureFrame()
-{
-    if(capWebam.isOpened()&& (capWebam.get(CV_CAP_PROP_POS_FRAMES)<capWebam.get(CV_CAP_PROP_FRAME_COUNT))&& sss<10)
     {
-        if(mmm==capWebam.get(CV_CAP_PROP_POS_FRAMES))
-            sss++;
+        QMutexLocker locker(&m_mutex);
+        m_error.clear();
+        m_frameSize = cv::Size();
+    }
+    if (isInterruptionRequested())
+        return;
+
+    try {
+        if (m_source == Source::Stream)
+            runStream();
         else
-        {
-//            qDebug() << capWebam.get(CV_CAP_PROP_POS_FRAMES);
-            mmm=capWebam.get(CV_CAP_PROP_POS_FRAMES);
-            capWebam.read(capturedFrame);
-            cv::Mat ff;
-            // = capturedFrame + cv::Scalar(-50, -50, -50); //decrease the brightness by 75 units
-            capturedFrame.copyTo(ff);
-            emit frameCaptured(ff);
+            runVideo();
+    } catch (const std::exception &) {
+        // Backend exception text can contain a stream URL and its credentials.
+        reportError(tr("Capture failed while opening or decoding the source."));
+    }
+}
+
+bool CaptureThread::waitForVideo()
+{
+    QMutexLocker locker(&m_mutex);
+    while (m_paused && !isInterruptionRequested())
+        m_stateChanged.wait(&m_mutex);
+    return !isInterruptionRequested();
+}
+
+bool CaptureThread::waitForNextFrame(unsigned long milliseconds)
+{
+    QMutexLocker locker(&m_mutex);
+    if (!isInterruptionRequested())
+        m_stateChanged.wait(&m_mutex, milliseconds);
+    return !isInterruptionRequested();
+}
+
+void CaptureThread::publishFrame(const cv::Mat &frame)
+{
+    {
+        QMutexLocker locker(&m_mutex);
+        if (isInterruptionRequested() || m_paused)
+            return;
+        m_frameSize = frame.size();
+    }
+    // Queued receivers must not share a buffer that the decoder will overwrite.
+    emit frameCaptured(frame.clone());
+}
+
+void CaptureThread::reportError(const QString &message)
+{
+    {
+        QMutexLocker locker(&m_mutex);
+        m_error = message;
+    }
+    emit captureError(message);
+}
+
+void CaptureThread::runVideo()
+{
+    cv::VideoCapture capture;
+    const bool opened = m_source == Source::Camera
+            ? capture.open(m_cameraIndex) : capture.open(m_videoPath);
+    if (!opened) {
+        reportError(tr("Cannot open the camera or video file."));
+        return;
+    }
+
+    cv::Mat frame;
+    while (waitForVideo()) {
+        // Live cameras may report no frame count. A failed read ends the session.
+        if (!capture.read(frame) || frame.empty()) {
+            if (m_source == Source::Camera && !isInterruptionRequested())
+                reportError(tr("The camera stopped delivering frames."));
+            break;
         }
+        publishFrame(frame);
+        if (!waitForNextFrame(40))
+            break;
     }
-    else
-    {
-        this->quit();
-        emit NULL;
+}
+
+void CaptureThread::runStream()
+{
+    if (m_streamUrl.isEmpty() || m_resolution.width <= 0 || m_resolution.height <= 0 ||
+            static_cast<unsigned>(m_resolution.width) >
+            (std::numeric_limits<unsigned>::max() - 31u) / 3u) {
+        reportError(tr("The stream URL and a positive frame size are required."));
+        return;
     }
 
-}
-//***************************************
-void CaptureThread::captureFrame1()
-{
-    if (videoBuffer)
-    {
-        // CV_8UC3 = 8 bits, 3 chanels
-        cv::Mat frame = cv::Mat(rtspReso, CV_8UC3, videoBuffer);
-        if(frame.empty())
-        {
-            qDebug() << "frame is empty";
-            emit NULL;
+    // All resources belong to this invocation of run(), including callback data.
+    StreamFrames frames(m_resolution);
+    const char *args[] = {"--ignore-config", "--no-audio", "--no-video-title-show", "--quiet"};
+    std::unique_ptr<libvlc_instance_t, decltype(&libvlc_release)> instance(
+                libvlc_new(sizeof(args) / sizeof(args[0]), args), &libvlc_release);
+    if (!instance) {
+        reportError(tr("Cannot initialize VLC."));
+        return;
+    }
+    const QByteArray url = m_streamUrl.toUtf8();
+    std::unique_ptr<libvlc_media_t, decltype(&libvlc_media_release)> media(
+                libvlc_media_new_location(instance.get(), url.constData()), &libvlc_media_release);
+    if (!media) {
+        reportError(tr("Cannot create the VLC media source."));
+        return;
+    }
+    std::unique_ptr<libvlc_media_player_t, PlayerDeleter> player(
+                libvlc_media_player_new_from_media(media.get()));
+    if (!player) {
+        reportError(tr("Cannot create the VLC player."));
+        return;
+    }
+
+    libvlc_video_set_callbacks(player.get(), lockVideo, unlockVideo, nullptr, &frames);
+    libvlc_video_set_format(player.get(), "RV24", m_resolution.width, m_resolution.height, frames.pitch);
+    if (libvlc_event_attach(libvlc_media_player_event_manager(player.get()),
+                           libvlc_MediaPlayerEncounteredError, streamError, &frames) != 0) {
+        reportError(tr("Cannot monitor VLC playback errors."));
+        return;
+    }
+    if (isInterruptionRequested())
+        return;
+    if (libvlc_media_player_play(player.get()) != 0) {
+        reportError(tr("Cannot start the stream."));
+        return;
+    }
+
+    bool playerPaused = false;
+    bool receivedFrame = false;
+    while (!isInterruptionRequested()) {
+        const libvlc_state_t state = libvlc_media_player_get_state(player.get());
+        if (frames.failed.load() || state == libvlc_Error) {
+            reportError(tr("VLC could not open or continue the stream."));
+            break;
         }
-        cv::Mat ff;
-        frame.copyTo(ff);
-        emit frameCaptured(ff);
-    }
 
-    else
-    {
-        this->quit();
-        emit NULL;
-    }
-
-}
-//***************************************
-void CaptureThread::release_ip()
-{
-    qDebug() << "release Ip camera";
-    libvlc_media_player_stop(mp);
-    libvlc_media_player_release(mp);
-    libvlc_release(inst);
-}
-//***************************************
-void CaptureThread::pause_ip()
-{
-    if(!pause)
-    {
-        qDebug() << "Pause Ip camera";
-        libvlc_media_player_pause(mp);
-        pause=true;
-    }
-    else
-    {
-        qDebug() << "Play Ip camera";
-        libvlc_media_player_play(mp);
-        pause=false;
+        const bool paused = isPaused();
+        // Apply pause after VLC finishes opening, so an early request is retained.
+        if (paused != playerPaused && (state == libvlc_Playing || state == libvlc_Paused)) {
+            libvlc_media_player_set_pause(player.get(), paused ? 1 : 0);
+            playerPaused = paused;
+        }
+        cv::Mat frame;
+        if (!paused) {
+            QMutexLocker locker(&frames.mutex);
+            if (frames.ready) {
+                const cv::Mat rgb(m_resolution, CV_8UC3, frames.pixels, frames.pitch);
+                cv::cvtColor(rgb, frame, cv::COLOR_RGB2BGR);
+                frames.ready = false;
+            }
+        }
+        if (!frame.empty()) {
+            receivedFrame = true;
+            publishFrame(frame);
+        }
+        if (state == libvlc_Ended) {
+            if (!receivedFrame)
+                reportError(tr("The stream ended without delivering video frames."));
+            break;
+        }
+        if (!waitForNextFrame(20))
+            break;
     }
 }
