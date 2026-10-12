@@ -15,7 +15,7 @@ class IP_Camera : public QWidget
     Q_OBJECT
 
 public:
-    explicit IP_Camera();
+    explicit IP_Camera(QWidget *parent = nullptr);
     ~IP_Camera();
     QString Ip;
     QString user;
@@ -23,6 +23,9 @@ public:
     bool my_closs;
     int width;
     int height;
+
+signals:
+    void cameraAccepted();
 
 private slots:
     void on_pushButton_clicked();

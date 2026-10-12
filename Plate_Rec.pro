@@ -10,7 +10,7 @@ QT       += sql
 greaterThan(QT_MAJOR_VERSION, 4): QT += widgets
 
 TARGET = Plate_Rec
-CONFIG += force_debug_info
+CONFIG += force_debug_info c++11
 TEMPLATE = app
 #####################    OPEN_CV DIR   #####################
 INCLUDEPATH += F:\my_work\install341\include
@@ -58,8 +58,6 @@ SOURCES += main.cpp\
     ip_camera.cpp \
     md5.cpp \
     reg.cpp \
-    capturethread1.cpp \
-    capturethread2.cpp \
     #plate_thread.cpp
     src/VideoSortDetector.cpp \
     src/Utils.cpp \
@@ -74,8 +72,6 @@ HEADERS  += mainwindow.h \
     ip_camera.h \
     md5.h \
     reg.h \
-    capturethread1.h \
-    capturethread2.h \
     include/config.h \
     include/Detector.h \
     include/Utils.h \

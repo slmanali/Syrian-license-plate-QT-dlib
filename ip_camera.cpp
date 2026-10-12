@@ -1,7 +1,8 @@
 #include "ip_camera.h"
 #include "ui_ip_camera.h"
 
-IP_Camera::IP_Camera() :
+IP_Camera::IP_Camera(QWidget *parent) :
+    QWidget(parent, Qt::Window),
     ui(new Ui::IP_Camera)
 {
     ui->setupUi(this);
@@ -33,6 +34,7 @@ void IP_Camera::on_pushButton_clicked()
             return;
         }
         my_closs=true;
+        emit cameraAccepted();
         this->close();
     }
     else
@@ -75,6 +77,7 @@ void IP_Camera::on_pushButton_clicked()
         width=ui->lineEdit_7->text().toInt();
         height=ui->lineEdit_8->text().toInt();
         my_closs=true;
+        emit cameraAccepted();
         this->close();
     }
 
